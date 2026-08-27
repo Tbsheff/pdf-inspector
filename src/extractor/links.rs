@@ -175,21 +175,15 @@ impl FormExtraction {
 
 const FF_RADIO: i64 = 1 << 15;
 const FF_PUSHBUTTON: i64 = 1 << 16;
+const OFF_STATE: &str = "Off";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ButtonKind {
-    Checkbox,
-    Radio,
-    PushButton,
-}
-
-fn button_kind(field_flags: i64) -> ButtonKind {
+fn button_control_kind(field_flags: i64) -> Option<FormControlKind> {
     if field_flags & FF_PUSHBUTTON != 0 {
-        ButtonKind::PushButton
+        None
     } else if field_flags & FF_RADIO != 0 {
-        ButtonKind::Radio
+        Some(FormControlKind::Radio)
     } else {
-        ButtonKind::Checkbox
+        Some(FormControlKind::Checkbox)
     }
 }
 
@@ -220,8 +214,6 @@ fn widget_export_value(doc: &Document, widget: &lopdf::Dictionary) -> Option<Str
 fn button_state_name(value: Option<&Object>) -> Option<String> {
     value.and_then(|v| v.as_name().ok()).map(name_to_string)
 }
-
-const OFF_STATE: &str = "Off";
 
 fn appearance_state_is_on(widget: &lopdf::Dictionary) -> bool {
     appearance_state(widget).is_some_and(|state| state != OFF_STATE)
@@ -493,10 +485,8 @@ fn walk_form_fields(
         .unwrap_or(1);
 
     if ft == b"Btn" {
-        let kind = match button_kind(inherited.field_flags) {
-            ButtonKind::PushButton => return,
-            ButtonKind::Radio => FormControlKind::Radio,
-            ButtonKind::Checkbox => FormControlKind::Checkbox,
+        let Some(kind) = button_control_kind(inherited.field_flags) else {
+            return;
         };
         let export_value = widget_export_value(doc, field_dict);
         let checked = widget_is_checked(

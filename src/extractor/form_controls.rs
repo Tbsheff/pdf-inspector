@@ -35,15 +35,6 @@ enum StampShape {
     Unchecked,
 }
 
-struct StampPlacement {
-    shape: StampShape,
-    page: u32,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
 pub(crate) fn extract_form_controls(doc: &Document, items: &[TextItem]) -> Vec<FormControl> {
     let page_map: HashMap<ObjectId, u32> = doc
         .get_pages()
@@ -52,7 +43,6 @@ pub(crate) fn extract_form_controls(doc: &Document, items: &[TextItem]) -> Vec<F
         .collect();
 
     let mut controls = extract_form_fields(doc, &page_map).controls;
-
     let widget_pages: HashSet<u32> = controls.iter().map(|control| control.page).collect();
     controls.extend(
         stamp_controls(doc)
@@ -70,235 +60,250 @@ pub(crate) fn extract_form_controls(doc: &Document, items: &[TextItem]) -> Vec<F
     controls
 }
 
-fn stamp_sized_image_ids(doc: &Document) -> HashSet<ObjectId> {
-    doc.objects
-        .iter()
-        .filter_map(|(id, object)| Some((id, object.as_stream().ok()?)))
-        .filter(|(_, stream)| {
-            let is_image = stream
-                .dict
-                .get(b"Subtype")
-                .ok()
-                .and_then(|o| o.as_name().ok())
-                .is_some_and(|name| name == b"Image");
-            let side = |key: &[u8]| stream.dict.get(key).ok().and_then(|o| o.as_i64().ok());
-            let fits = matches!(
-                (side(b"Width"), side(b"Height")),
-                (Some(w), Some(h)) if (2..=MAX_STAMP_PIXELS).contains(&w)
-                    && (2..=MAX_STAMP_PIXELS).contains(&h)
-            );
-            is_image && fits
-        })
-        .map(|(id, _)| *id)
-        .collect()
+fn is_stamp_sized_image(stream: &Stream) -> bool {
+    let is_image = stream
+        .dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|name| name == b"Image");
+    let side = |key: &[u8]| {
+        stream
+            .dict
+            .get(key)
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .is_some_and(|value| (2..=MAX_STAMP_PIXELS).contains(&value))
+    };
+    is_image && side(b"Width") && side(b"Height")
 }
 
 fn stamp_controls(doc: &Document) -> Vec<FormControl> {
-    let candidates = stamp_sized_image_ids(doc);
+    let candidates: HashSet<ObjectId> = doc
+        .objects
+        .iter()
+        .filter(|(_, object)| object.as_stream().is_ok_and(is_stamp_sized_image))
+        .map(|(id, _)| *id)
+        .collect();
     if candidates.is_empty() {
         return Vec::new();
     }
 
-    let mut classified: HashMap<ObjectId, Option<StampShape>> = HashMap::new();
-    let mut by_page: HashMap<u32, Vec<StampPlacement>> = HashMap::new();
-
-    for (page_num, page_id) in doc.get_pages() {
-        let Ok(content) = doc.get_and_decode_page_content(page_id) else {
-            continue;
-        };
-        let xobjects = page_xobjects(doc, page_id);
-        let mut budget = MAX_CONTENT_OPERATIONS;
-        let mut placements = Vec::new();
-        collect_stamp_placements(
-            doc,
-            &content.operations,
-            &xobjects,
-            &candidates,
-            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            page_num,
-            &mut classified,
-            &mut placements,
-            &mut budget,
-            0,
-        );
-        if placements.len() >= MIN_STAMPS_PER_PAGE {
-            by_page.insert(page_num, placements);
-        } else if !placements.is_empty() {
-            log::debug!(
-                "page {page_num}: dropped {} checkbox stamp(s), fewer than the {MIN_STAMPS_PER_PAGE} needed to treat them as a form",
-                placements.len()
-            );
-        }
-    }
-
+    let mut scan = StampScan {
+        doc,
+        candidates,
+        classified: HashMap::new(),
+        budget: MAX_CONTENT_OPERATIONS,
+        page: 0,
+    };
     let mut controls = Vec::new();
-    for placements in by_page.into_values() {
-        for placement in placements {
-            controls.push(FormControl {
-                name: String::new(),
-                kind: FormControlKind::Checkbox,
-                export_value: None,
-                checked: placement.shape == StampShape::Checked,
-                label: None,
-                tooltip: None,
-                source: FormControlSource::StampImage,
-                page: placement.page,
-                x: placement.x,
-                y: placement.y,
-                width: placement.width,
-                height: placement.height,
-            });
-        }
+    for (page_num, page_id) in doc.get_pages() {
+        controls.extend(scan.page_controls(page_num, page_id));
     }
     controls
+}
+
+struct StampScan<'a> {
+    doc: &'a Document,
+    candidates: HashSet<ObjectId>,
+    classified: HashMap<ObjectId, Option<StampShape>>,
+    budget: usize,
+    page: u32,
+}
+
+impl StampScan<'_> {
+    fn page_controls(&mut self, page_num: u32, page_id: ObjectId) -> Vec<FormControl> {
+        let Ok(content) = self.doc.get_and_decode_page_content(page_id) else {
+            return Vec::new();
+        };
+        self.page = page_num;
+        self.budget = MAX_CONTENT_OPERATIONS;
+
+        let mut found = Vec::new();
+        let xobjects = page_xobjects(self.doc, page_id);
+        let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        self.walk(&content.operations, &xobjects, &identity, 0, &mut found);
+
+        if found.len() >= MIN_STAMPS_PER_PAGE {
+            return found;
+        }
+        if !found.is_empty() {
+            log::debug!(
+                "page {page_num}: dropped {} checkbox stamp(s), fewer than the {MIN_STAMPS_PER_PAGE} needed to treat them as a form",
+                found.len()
+            );
+        }
+        Vec::new()
+    }
+
+    fn walk(
+        &mut self,
+        operations: &[Operation],
+        xobjects: &HashMap<String, ObjectId>,
+        base_ctm: &[f32; 6],
+        depth: usize,
+        found: &mut Vec<FormControl>,
+    ) {
+        let mut ctm = *base_ctm;
+        let mut stack: Vec<[f32; 6]> = Vec::new();
+
+        for op in operations {
+            if self.budget == 0 {
+                return;
+            }
+            self.budget -= 1;
+            match op.operator.as_str() {
+                "q" => stack.push(ctm),
+                "Q" => {
+                    if let Some(saved) = stack.pop() {
+                        ctm = saved;
+                    }
+                }
+                "cm" if op.operands.len() >= 6 => {
+                    let mut m = [0.0f32; 6];
+                    for (i, operand) in op.operands.iter().take(6).enumerate() {
+                        m[i] = get_number(operand).unwrap_or(0.0);
+                    }
+                    ctm = multiply_matrices(&m, &ctm);
+                }
+                "Do" => self.enter_xobject(op, xobjects, &ctm, depth, found),
+                _ => {}
+            }
+        }
+    }
+
+    fn enter_xobject(
+        &mut self,
+        op: &Operation,
+        xobjects: &HashMap<String, ObjectId>,
+        ctm: &[f32; 6],
+        depth: usize,
+        found: &mut Vec<FormControl>,
+    ) {
+        let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+            return;
+        };
+        let Some(&id) = xobjects.get(String::from_utf8_lossy(name).as_ref()) else {
+            return;
+        };
+        let Ok(stream) = self.doc.get_object(id).and_then(|o| o.as_stream()) else {
+            return;
+        };
+
+        if self.candidates.contains(&id) {
+            self.push_stamp(id, stream, ctm, found);
+            return;
+        }
+        if depth < MAX_XOBJECT_DEPTH && is_form_xobject(stream) {
+            self.enter_form(stream, ctm, depth, found);
+        }
+    }
+
+    fn push_stamp(
+        &mut self,
+        id: ObjectId,
+        stream: &Stream,
+        ctm: &[f32; 6],
+        found: &mut Vec<FormControl>,
+    ) {
+        let (x, y, width, height) = image_bbox_from_ctm(ctm);
+        if !is_stamp_sized(width, height) {
+            return;
+        }
+        let doc = self.doc;
+        let shape = *self
+            .classified
+            .entry(id)
+            .or_insert_with(|| classify_stamp_image(doc, stream));
+        let Some(shape) = shape else { return };
+
+        found.push(FormControl {
+            name: String::new(),
+            kind: FormControlKind::Checkbox,
+            export_value: None,
+            checked: shape == StampShape::Checked,
+            label: None,
+            tooltip: None,
+            source: FormControlSource::StampImage,
+            page: self.page,
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+
+    fn enter_form(
+        &mut self,
+        stream: &Stream,
+        ctm: &[f32; 6],
+        depth: usize,
+        found: &mut Vec<FormControl>,
+    ) {
+        let bytes = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
+        let Ok(content) = lopdf::content::Content::decode(&bytes) else {
+            return;
+        };
+        let nested_ctm = multiply_matrices(&form_matrix(stream), ctm);
+        let nested_xobjects = stream
+            .dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|o| resolve_dict(self.doc, o))
+            .map(|resources| xobject_ids(self.doc, resources))
+            .unwrap_or_default();
+        self.walk(
+            &content.operations,
+            &nested_xobjects,
+            &nested_ctm,
+            depth + 1,
+            found,
+        );
+    }
+}
+
+fn is_form_xobject(stream: &Stream) -> bool {
+    stream
+        .dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|name| name == b"Form")
 }
 
 fn page_xobjects(doc: &Document, page_id: ObjectId) -> HashMap<String, ObjectId> {
     let Ok((page_dict, inherited)) = doc.get_page_resources(page_id) else {
         return HashMap::new();
     };
-    let mut out = HashMap::new();
-    if let Some(dict) = page_dict {
-        collect_xobject_ids(doc, dict, &mut out);
-    }
-    for id in inherited {
-        if let Ok(dict) = doc.get_dictionary(id) {
-            collect_xobject_ids(doc, dict, &mut out);
-        }
-    }
-    out
+    let inherited_dicts = inherited
+        .into_iter()
+        .filter_map(|id| doc.get_dictionary(id).ok());
+    page_dict
+        .into_iter()
+        .chain(inherited_dicts)
+        .flat_map(|resources| xobject_ids(doc, resources))
+        .collect()
 }
 
-fn resource_xobjects(doc: &Document, resources: &Dictionary) -> HashMap<String, ObjectId> {
-    let mut out = HashMap::new();
-    collect_xobject_ids(doc, resources, &mut out);
-    out
-}
-
-fn collect_xobject_ids(
-    doc: &Document,
-    resources: &Dictionary,
-    out: &mut HashMap<String, ObjectId>,
-) {
+fn xobject_ids(doc: &Document, resources: &Dictionary) -> HashMap<String, ObjectId> {
     let Some(xobjects) = resources
         .get(b"XObject")
         .ok()
         .and_then(|o| resolve_dict(doc, o))
     else {
-        return;
+        return HashMap::new();
     };
-    for (name, value) in xobjects.iter() {
-        if let Ok(id) = value.as_reference() {
-            out.insert(String::from_utf8_lossy(name).to_string(), id);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_stamp_placements(
-    doc: &Document,
-    operations: &[Operation],
-    xobjects: &HashMap<String, ObjectId>,
-    candidates: &HashSet<ObjectId>,
-    base_ctm: &[f32; 6],
-    page_num: u32,
-    classified: &mut HashMap<ObjectId, Option<StampShape>>,
-    placements: &mut Vec<StampPlacement>,
-    budget: &mut usize,
-    depth: usize,
-) {
-    let mut ctm = *base_ctm;
-    let mut stack: Vec<[f32; 6]> = Vec::new();
-
-    for op in operations {
-        if *budget == 0 {
-            return;
-        }
-        *budget -= 1;
-        match op.operator.as_str() {
-            "q" => stack.push(ctm),
-            "Q" => {
-                if let Some(saved) = stack.pop() {
-                    ctm = saved;
-                }
-            }
-            "cm" if op.operands.len() >= 6 => {
-                let mut m = [0.0f32; 6];
-                for (i, operand) in op.operands.iter().take(6).enumerate() {
-                    m[i] = get_number(operand).unwrap_or(0.0);
-                }
-                ctm = multiply_matrices(&m, &ctm);
-            }
-            "Do" => {
-                let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
-                    continue;
-                };
-                let Some(&id) = xobjects.get(String::from_utf8_lossy(name).as_ref()) else {
-                    continue;
-                };
-                let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
-                    continue;
-                };
-                match stream
-                    .dict
-                    .get(b"Subtype")
-                    .ok()
-                    .and_then(|o| o.as_name().ok())
-                {
-                    Some(b"Image") => {
-                        let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                        if !candidates.contains(&id) || !is_stamp_sized(width, height) {
-                            continue;
-                        }
-                        let shape = *classified
-                            .entry(id)
-                            .or_insert_with(|| classify_stamp_image(doc, stream));
-                        if let Some(shape) = shape {
-                            placements.push(StampPlacement {
-                                shape,
-                                page: page_num,
-                                x,
-                                y,
-                                width,
-                                height,
-                            });
-                        }
-                    }
-                    Some(b"Form") if depth < MAX_XOBJECT_DEPTH => {
-                        let Ok(content) = lopdf::content::Content::decode(
-                            &stream
-                                .decompressed_content()
-                                .unwrap_or(stream.content.clone()),
-                        ) else {
-                            continue;
-                        };
-                        let nested_ctm = multiply_matrices(&form_matrix(stream), &ctm);
-                        let nested_xobjects = stream
-                            .dict
-                            .get(b"Resources")
-                            .ok()
-                            .and_then(|o| resolve_dict(doc, o))
-                            .map(|resources| resource_xobjects(doc, resources))
-                            .unwrap_or_default();
-                        collect_stamp_placements(
-                            doc,
-                            &content.operations,
-                            &nested_xobjects,
-                            candidates,
-                            &nested_ctm,
-                            page_num,
-                            classified,
-                            placements,
-                            budget,
-                            depth + 1,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
+    xobjects
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((
+                String::from_utf8_lossy(name).to_string(),
+                value.as_reference().ok()?,
+            ))
+        })
+        .collect()
 }
 
 fn form_matrix(stream: &Stream) -> [f32; 6] {
@@ -338,38 +343,12 @@ impl LumaGrid {
         self.samples[(row * self.width + col) as usize]
     }
 
-    fn interior_strong_ink(&self) -> Option<f32> {
-        let inset_x = ((self.width as f32 * INTERIOR_INSET_FRACTION).round() as i64).max(1);
-        let inset_y = ((self.height as f32 * INTERIOR_INSET_FRACTION).round() as i64).max(1);
-        if self.width - 2 * inset_x < 1 || self.height - 2 * inset_y < 1 {
-            return None;
-        }
+    fn ink_ratio(&self, max_luma: u8, mut covers: impl FnMut(i64, i64) -> bool) -> Option<f32> {
         let mut total = 0usize;
         let mut inked = 0usize;
-        for row in inset_y..self.height - inset_y {
-            for col in inset_x..self.width - inset_x {
-                total += 1;
-                if self.at(row, col) < STRONG_INK_LUMA {
-                    inked += 1;
-                }
-            }
-        }
-        Some(inked as f32 / total as f32)
-    }
-
-    fn ring_ink(&self, depth: i64, max_luma: u8) -> Option<f32> {
-        if self.width - 2 * depth < 2 || self.height - 2 * depth < 2 {
-            return None;
-        }
-        let mut total = 0usize;
-        let mut inked = 0usize;
-        for row in depth..self.height - depth {
-            for col in depth..self.width - depth {
-                let on_ring = row == depth
-                    || row == self.height - depth - 1
-                    || col == depth
-                    || col == self.width - depth - 1;
-                if !on_ring {
+        for row in 0..self.height {
+            for col in 0..self.width {
+                if !covers(row, col) {
                     continue;
                 }
                 total += 1;
@@ -378,7 +357,35 @@ impl LumaGrid {
                 }
             }
         }
-        Some(inked as f32 / total as f32)
+        (total > 0).then(|| inked as f32 / total as f32)
+    }
+
+    fn inset(&self) -> (i64, i64) {
+        let scale = |side: i64| ((side as f32 * INTERIOR_INSET_FRACTION).round() as i64).max(1);
+        (scale(self.width), scale(self.height))
+    }
+
+    fn interior_ink(&self) -> Option<f32> {
+        let (inset_x, inset_y) = self.inset();
+        self.ink_ratio(STRONG_INK_LUMA, |row, col| {
+            (inset_y..self.height - inset_y).contains(&row)
+                && (inset_x..self.width - inset_x).contains(&col)
+        })
+    }
+
+    fn ring_ink(&self, depth: i64, max_luma: u8) -> Option<f32> {
+        if self.width - 2 * depth < 2 || self.height - 2 * depth < 2 {
+            return None;
+        }
+        self.ink_ratio(max_luma, |row, col| {
+            let inside = (depth..self.height - depth).contains(&row)
+                && (depth..self.width - depth).contains(&col);
+            let on_edge = row == depth
+                || row == self.height - depth - 1
+                || col == depth
+                || col == self.width - depth - 1;
+            inside && on_edge
+        })
     }
 
     fn outline_ink(&self, max_luma: u8) -> f32 {
@@ -393,7 +400,7 @@ fn classify_stamp_image(doc: &Document, stream: &Stream) -> Option<StampShape> {
 }
 
 fn classify_luma_grid(grid: &LumaGrid) -> Option<StampShape> {
-    let interior_ink = grid.interior_strong_ink()?;
+    let interior_ink = grid.interior_ink()?;
     let outline_ink = grid.outline_ink(ANY_INK_LUMA);
     let outline_solid = grid.outline_ink(STRONG_INK_LUMA);
 
@@ -503,10 +510,8 @@ fn colorspace_components(doc: &Document, stream: &Stream) -> Option<i64> {
                 .and_then(|o| o.as_stream().ok())
                 .and_then(|icc| icc.dict.get(b"N").ok())
                 .and_then(|n| n.as_i64().ok()),
-            Some(b"Indexed") | Some(b"I") | Some(b"Separation") => Some(1),
-            Some(b"DeviceN") => None,
-            Some(b"CalGray") => Some(1),
-            Some(b"CalRGB") | Some(b"Lab") => Some(3),
+            Some(b"Indexed" | b"I" | b"Separation" | b"CalGray") => Some(1),
+            Some(b"CalRGB" | b"Lab") => Some(3),
             _ => None,
         },
         _ => None,

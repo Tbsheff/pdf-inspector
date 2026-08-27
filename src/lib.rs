@@ -756,6 +756,10 @@ fn covers_control(item: &TextItem, control: &FormControl) -> bool {
         && (item.height - control.height).abs() <= CONTROL_POSITION_TOLERANCE
 }
 
+fn names_nothing(export_value: &str) -> bool {
+    ["yes", "on", "1"].contains(&export_value.to_ascii_lowercase().as_str())
+}
+
 fn control_marker_text(control: &FormControl) -> String {
     let marker = control_marker(control.checked);
     if control.label.is_some() {
@@ -764,14 +768,13 @@ fn control_marker_text(control: &FormControl) -> String {
     let own_words = control
         .export_value
         .as_deref()
-        .filter(|value| !value.eq_ignore_ascii_case("yes") && !value.eq_ignore_ascii_case("on"))
-        .or(Some(control.name.as_str()))
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match own_words {
-        Some(words) => format!("{marker} {words}"),
-        None => marker.to_string(),
+        .filter(|value| !names_nothing(value))
+        .unwrap_or(&control.name)
+        .trim();
+    if own_words.is_empty() {
+        return marker.to_string();
     }
+    format!("{marker} {own_words}")
 }
 
 fn control_marker_item(control: &FormControl) -> TextItem {
@@ -814,22 +817,17 @@ fn apply_form_control_markers(
         let covered = matches!(item.item_type, types::ItemType::Image)
             .then(|| by_page.get(&item.page))
             .flatten()
-            .and_then(|page_controls| {
-                page_controls
-                    .iter()
-                    .copied()
-                    .find(|&index| !matched[index] && covers_control(&item, &controls[index]))
-            });
-        match covered {
-            Some(index) => {
-                matched[index] = true;
-                item.text = control_marker_text(&controls[index]);
-                item.item_type = types::ItemType::FormField;
-                item.font_size = controls[index].height.max(1.0);
-                out.push(item);
-            }
-            None => out.push(item),
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|&index| !matched[index] && covers_control(&item, &controls[index]));
+        if let Some(index) = covered {
+            matched[index] = true;
+            item.text = control_marker_text(&controls[index]);
+            item.item_type = types::ItemType::FormField;
+            item.font_size = controls[index].height.max(1.0);
         }
+        out.push(item);
     }
 
     let appended: Vec<TextItem> = controls
