@@ -51,6 +51,8 @@ pub struct PyPdfResult {
     /// Whether encoding issues were detected.
     #[pyo3(get)]
     pub has_encoding_issues: bool,
+    #[pyo3(get)]
+    pub form_controls: Vec<PyFormControl>,
 }
 
 #[pymethods]
@@ -61,6 +63,65 @@ impl PyPdfResult {
             self.pdf_type, self.page_count, self.confidence
         )
     }
+}
+
+#[pyclass(name = "FormControl")]
+#[derive(Clone)]
+pub struct PyFormControl {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub source: String,
+    #[pyo3(get)]
+    pub export_value: Option<String>,
+    #[pyo3(get)]
+    pub checked: bool,
+    #[pyo3(get)]
+    pub label: Option<String>,
+    #[pyo3(get)]
+    pub tooltip: Option<String>,
+    #[pyo3(get)]
+    pub page: u32,
+    #[pyo3(get)]
+    pub x: f32,
+    #[pyo3(get)]
+    pub y: f32,
+    #[pyo3(get)]
+    pub width: f32,
+    #[pyo3(get)]
+    pub height: f32,
+}
+
+#[pymethods]
+impl PyFormControl {
+    fn __repr__(&self) -> String {
+        format!(
+            "FormControl(name='{}', kind='{}', export_value={:?}, checked={}, label={:?}, page={})",
+            self.name, self.kind, self.export_value, self.checked, self.label, self.page
+        )
+    }
+}
+
+fn to_py_form_controls(controls: Vec<crate::FormControl>) -> Vec<PyFormControl> {
+    controls
+        .into_iter()
+        .map(|control| PyFormControl {
+            name: control.name,
+            kind: control.kind.as_str().to_string(),
+            source: control.source.as_str().to_string(),
+            export_value: control.export_value,
+            checked: control.checked,
+            label: control.label,
+            tooltip: control.tooltip,
+            page: control.page,
+            x: control.x,
+            y: control.y,
+            width: control.width,
+            height: control.height,
+        })
+        .collect()
 }
 
 /// OCR reasons for a single 1-indexed page.
@@ -448,6 +509,7 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        form_controls: to_py_form_controls(r.form_controls),
     }
 }
 
@@ -991,11 +1053,24 @@ fn extract_structure_elements_bytes(
     Ok(convert_structure_elements(elements))
 }
 
+#[pyfunction]
+fn extract_form_controls(path: &str) -> PyResult<Vec<PyFormControl>> {
+    let controls = crate::extract_form_controls(path).map_err(to_py_err)?;
+    Ok(to_py_form_controls(controls))
+}
+
+#[pyfunction]
+fn extract_form_controls_bytes(data: &[u8]) -> PyResult<Vec<PyFormControl>> {
+    let controls = crate::extract_form_controls_mem(data).map_err(to_py_err)?;
+    Ok(to_py_form_controls(controls))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
     m.add_class::<PyPageOcrReasons>()?;
+    m.add_class::<PyFormControl>()?;
     m.add_class::<PyOcrModelIdentity>()?;
     m.add_class::<PyOcrTimings>()?;
     m.add_class::<PyOcrPageProvenance>()?;
@@ -1021,6 +1096,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_with_positions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_form_controls, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_form_controls_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;

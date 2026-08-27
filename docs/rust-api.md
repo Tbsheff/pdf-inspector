@@ -487,6 +487,32 @@ for item in extract_text_with_positions("tagged.pdf")? {
 }
 ```
 
+Read checkbox and radio state. Both interactive `/AcroForm` widgets and
+flattened checkboxes drawn as small images are recovered, unchecked options
+included, so the full state of a questionnaire is reconstructable:
+
+```rust
+use pdf_inspector::{extract_form_controls, FormControlKind};
+
+// Reading order. `checked` is set for the selected option of a radio group;
+// options of one group share `name` and differ by `export_value`.
+for control in extract_form_controls("assessment.pdf")? {
+    let mark = if control.checked { "x" } else { " " };
+    let words = control
+        .label
+        .as_deref()
+        .or(control.export_value.as_deref())
+        .unwrap_or("");
+    match control.kind {
+        FormControlKind::Radio => println!("[{mark}] {}: {words}", control.name),
+        FormControlKind::Checkbox => println!("[{mark}] {words}"),
+    }
+}
+```
+
+The same controls are on `PdfProcessResult::form_controls`, and the markdown
+carries `[x]` / `[ ]` inline so the answer travels with the option text.
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -514,6 +540,8 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
+| `extract_form_controls(path)` | Every checkbox / radio option with position and state |
+| `extract_form_controls_mem(bytes)` | Form controls from bytes |
 
 Low-level detection functions are also available via the `detector` module (`detect_pdf_type`, `detect_pdf_type_with_config`, etc.) for callers who need `PdfTypeResult` instead of `PdfProcessResult`.
 
@@ -524,13 +552,16 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PdfOptions` | Builder for processing configuration (mode, detection, markdown, page filter) |
 | `ProcessMode` | `DetectOnly`, `Analyze`, `Full` |
 | `PdfType` | `TextBased`, `Scanned`, `ImageBased`, `Mixed` |
-| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing |
+| `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, form_controls, timing |
 | `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR |
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with position, font info, page number, and optional structure-tree `mcid` |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
+| `FormControl` | One checkbox / radio option: name, kind, export_value, checked, label, tooltip, source, page, bbox |
+| `FormControlKind` | `Checkbox`, `Radio` |
+| `FormControlSource` | `AcroForm` (interactive widget), `StampImage` (flattened, classified by ink) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |

@@ -6,8 +6,9 @@ mod base14;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
+pub(crate) mod form_controls;
 mod layout;
-mod links;
+pub(crate) mod links;
 mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
@@ -430,6 +431,7 @@ fn extract_positioned_text_impl(
 
     // Extract AcroForm field values
     let form_items = extract_form_fields(doc, &page_id_to_num)
+        .items
         .into_iter()
         .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
     all_items.extend(form_items);

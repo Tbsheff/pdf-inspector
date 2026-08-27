@@ -58,7 +58,9 @@ pub use markdown::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{
+    FormControl, FormControlKind, FormControlSource, LayoutComplexity, PdfLine, PdfRect, TextItem,
+};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -156,6 +158,7 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    pub form_controls: Vec<FormControl>,
 }
 
 // =========================================================================
@@ -733,6 +736,115 @@ fn extract_pages_markdown_mem_impl(
 /// structure such as a table. Logos, icons, and decorative rules remain below
 /// these physical-size gates. OCR still has to produce a valid table inside
 /// the region before any text is fused into a clean native page.
+const CHECKED_MARKER: &str = "[x]";
+const UNCHECKED_MARKER: &str = "[ ]";
+const CONTROL_POSITION_TOLERANCE: f32 = 0.5;
+
+fn control_marker(checked: bool) -> &'static str {
+    if checked {
+        CHECKED_MARKER
+    } else {
+        UNCHECKED_MARKER
+    }
+}
+
+fn covers_control(item: &TextItem, control: &FormControl) -> bool {
+    item.page == control.page
+        && (item.x - control.x).abs() <= CONTROL_POSITION_TOLERANCE
+        && (item.y - control.y).abs() <= CONTROL_POSITION_TOLERANCE
+        && (item.width - control.width).abs() <= CONTROL_POSITION_TOLERANCE
+        && (item.height - control.height).abs() <= CONTROL_POSITION_TOLERANCE
+}
+
+fn control_marker_text(control: &FormControl) -> String {
+    let marker = control_marker(control.checked);
+    if control.label.is_some() {
+        return marker.to_string();
+    }
+    let own_words = control
+        .export_value
+        .as_deref()
+        .filter(|value| !value.eq_ignore_ascii_case("yes") && !value.eq_ignore_ascii_case("on"))
+        .or(Some(control.name.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match own_words {
+        Some(words) => format!("{marker} {words}"),
+        None => marker.to_string(),
+    }
+}
+
+fn control_marker_item(control: &FormControl) -> TextItem {
+    TextItem {
+        text: control_marker_text(control),
+        x: control.x,
+        y: control.y,
+        width: control.width,
+        height: control.height,
+        font: String::new(),
+        font_tag: String::new(),
+        font_size: control.height.max(1.0),
+        page: control.page,
+        is_bold: false,
+        is_italic: false,
+        is_underline: false,
+        is_strikeout: false,
+        item_type: types::ItemType::FormField,
+        mcid: None,
+    }
+}
+
+fn apply_form_control_markers(
+    items: Vec<TextItem>,
+    controls: &[FormControl],
+    page_number_mask: &mut Vec<bool>,
+) -> Vec<TextItem> {
+    if controls.is_empty() {
+        return items;
+    }
+
+    let mut by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, control) in controls.iter().enumerate() {
+        by_page.entry(control.page).or_default().push(index);
+    }
+    let mut matched = vec![false; controls.len()];
+    let mut out = Vec::with_capacity(items.len() + controls.len());
+
+    for mut item in items {
+        let covered = matches!(item.item_type, types::ItemType::Image)
+            .then(|| by_page.get(&item.page))
+            .flatten()
+            .and_then(|page_controls| {
+                page_controls
+                    .iter()
+                    .copied()
+                    .find(|&index| !matched[index] && covers_control(&item, &controls[index]))
+            });
+        match covered {
+            Some(index) => {
+                matched[index] = true;
+                item.text = control_marker_text(&controls[index]);
+                item.item_type = types::ItemType::FormField;
+                item.font_size = controls[index].height.max(1.0);
+                out.push(item);
+            }
+            None => out.push(item),
+        }
+    }
+
+    let appended: Vec<TextItem> = controls
+        .iter()
+        .zip(&matched)
+        .filter(|(_, &was_matched)| !was_matched)
+        .map(|(control, _)| control_marker_item(control))
+        .collect();
+    if !page_number_mask.is_empty() {
+        page_number_mask.resize(page_number_mask.len() + appended.len(), false);
+    }
+    out.extend(appended);
+    out
+}
+
 #[cfg(any(test, all(feature = "ocr", not(target_arch = "wasm32"))))]
 fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
     const MIN_WIDTH_PT: f32 = 108.0;
@@ -961,6 +1073,23 @@ pub fn extract_structure_elements<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
     extract_structure_elements_mem(&buffer, pages)
+}
+
+pub fn extract_form_controls_mem(buffer: &[u8]) -> Result<Vec<FormControl>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages) =
+        extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
+    Ok(extractor::form_controls::extract_form_controls(
+        &doc, &items,
+    ))
+}
+
+pub fn extract_form_controls<P: AsRef<Path>>(path: P) -> Result<Vec<FormControl>, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_form_controls_mem(&buffer)
 }
 
 // =========================================================================
@@ -4138,6 +4267,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            form_controls: Vec::new(),
         });
     }
 
@@ -4154,6 +4284,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            form_controls: Vec::new(),
         });
     }
 
@@ -4233,6 +4364,7 @@ fn process_document(
         })
         .unwrap_or((None, Vec::new()));
 
+    let mut form_controls: Vec<FormControl> = Vec::new();
     let (
         markdown,
         layout,
@@ -4327,7 +4459,7 @@ fn process_document(
             let FolioFilteredItems {
                 items,
                 layout_items,
-                removal_mask,
+                mut removal_mask,
                 removed_pages,
             } = select_items_with_document_folio_context(
                 items,
@@ -4345,6 +4477,9 @@ fn process_document(
                 &lines,
                 &chart_regions,
             );
+
+            form_controls = extractor::form_controls::extract_form_controls(&doc, &items);
+            let items = apply_form_control_markers(items, &form_controls, &mut removal_mask);
 
             let md = if options.mode == ProcessMode::Analyze {
                 None
@@ -4488,6 +4623,7 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        form_controls,
     })
 }
 
@@ -7675,5 +7811,272 @@ mod tests {
     fn recover_startxref_pointer_returns_none_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
         assert!(recover_startxref_pointer(buf).is_none());
+    }
+}
+
+#[cfg(test)]
+mod form_control_marker_tests {
+    use super::*;
+    use crate::types::{FormControlKind, FormControlSource};
+
+    fn control(kind: FormControlKind, checked: bool) -> FormControl {
+        FormControl {
+            name: String::new(),
+            kind,
+            export_value: None,
+            checked,
+            label: None,
+            tooltip: None,
+            source: FormControlSource::AcroForm,
+            page: 1,
+            x: 10.0,
+            y: 20.0,
+            width: 8.0,
+            height: 8.0,
+        }
+    }
+
+    fn image_item(x: f32, y: f32) -> TextItem {
+        TextItem {
+            text: "[Image: X7]".to_string(),
+            x,
+            y,
+            width: 8.0,
+            height: 8.0,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size: 0.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Image,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn labelled_control_marker_stays_bare() {
+        let mut c = control(FormControlKind::Checkbox, true);
+        c.label = Some("Fall risk".to_string());
+        c.name = "fall_risk".to_string();
+        assert_eq!(control_marker_text(&c), "[x]");
+    }
+
+    #[test]
+    fn unlabelled_widget_keeps_its_field_name() {
+        let mut c = control(FormControlKind::Checkbox, false);
+        c.name = "fall_risk".to_string();
+        c.export_value = Some("Yes".to_string());
+        assert_eq!(control_marker_text(&c), "[ ] fall_risk");
+    }
+
+    #[test]
+    fn unlabelled_radio_option_keeps_its_export_value() {
+        let mut c = control(FormControlKind::Radio, true);
+        c.name = "M1860".to_string();
+        c.export_value = Some("3".to_string());
+        assert_eq!(control_marker_text(&c), "[x] 3");
+    }
+
+    #[test]
+    fn anonymous_stamp_marker_has_no_words() {
+        let mut c = control(FormControlKind::Checkbox, false);
+        c.source = FormControlSource::StampImage;
+        assert_eq!(control_marker_text(&c), "[ ]");
+    }
+
+    #[test]
+    fn covering_image_becomes_the_marker_and_is_not_duplicated() {
+        let mut c = control(FormControlKind::Checkbox, true);
+        c.label = Some("Bedbound".to_string());
+        let out = apply_form_control_markers(vec![image_item(10.0, 20.0)], &[c], &mut Vec::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "[x]");
+        assert!(matches!(out[0].item_type, types::ItemType::FormField));
+    }
+
+    #[test]
+    fn widget_without_a_covering_image_is_appended() {
+        let mut c = control(FormControlKind::Checkbox, false);
+        c.name = "consent".to_string();
+        let out = apply_form_control_markers(vec![image_item(400.0, 700.0)], &[c], &mut Vec::new());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "[Image: X7]");
+        assert_eq!(out[1].text, "[ ] consent");
+    }
+
+    #[test]
+    fn two_controls_never_claim_the_same_image() {
+        let mut first = control(FormControlKind::Checkbox, true);
+        first.label = Some("A".to_string());
+        let mut second = control(FormControlKind::Checkbox, false);
+        second.label = Some("B".to_string());
+        let out = apply_form_control_markers(
+            vec![image_item(10.0, 20.0)],
+            &[first, second],
+            &mut Vec::new(),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "[x]");
+        assert_eq!(out[1].text, "[ ]");
+    }
+
+    #[test]
+    fn no_controls_leaves_items_untouched() {
+        let out = apply_form_control_markers(vec![image_item(10.0, 20.0)], &[], &mut Vec::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "[Image: X7]");
+        assert!(matches!(out[0].item_type, types::ItemType::Image));
+    }
+}
+
+#[cfg(test)]
+mod acroform_end_to_end_tests {
+    use super::*;
+    use lopdf::{dictionary, Document, Object, ObjectId, Stream};
+
+    fn radio_form_pdf() -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.new_object_id();
+
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let content = b"BT /F1 10 Tf 1 0 0 1 130 700 Tm (Independent) Tj ET\n\
+                        BT /F1 10 Tf 1 0 0 1 130 680 Tm (Needs help) Tj ET"
+            .to_vec();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+
+        let widgets: Vec<(ObjectId, &str, i64)> = ["Independent", "NeedsHelp"]
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let y = 698 - (index as i64) * 20;
+                let id = doc.add_object(dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Widget",
+                    "Rect" => vec![110.into(), y.into(), (y + 12).into(), (y + 12).into()],
+                    "P" => Object::Reference(page_id),
+                    "AS" => Object::Name(b"Off".to_vec()),
+                    "AP" => dictionary! {
+                        "N" => dictionary! {
+                            "Off" => Object::Null,
+                            *option => Object::Null,
+                        },
+                    },
+                });
+                (id, *option, y)
+            })
+            .collect();
+
+        for (id, _, y) in &widgets {
+            if let Ok(widget) = doc.get_object_mut(*id).and_then(|o| o.as_dict_mut()) {
+                widget.set(
+                    "Rect",
+                    vec![110.into(), (*y).into(), 122.into(), (*y + 12).into()],
+                );
+            }
+        }
+
+        let group_id = doc.add_object(dictionary! {
+            "FT" => "Btn",
+            "T" => Object::string_literal("M1860"),
+            "TU" => Object::string_literal("Ambulation and locomotion"),
+            "Ff" => Object::Integer(1 << 15),
+            "V" => Object::Name(b"Independent".to_vec()),
+            "Kids" => widgets.iter().map(|(id, _, _)| Object::Reference(*id)).collect::<Vec<_>>(),
+        });
+
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => Object::Reference(content_id),
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font_id) } },
+                "Annots" => widgets.iter().map(|(id, _, _)| Object::Reference(*id)).collect::<Vec<_>>(),
+            }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(group_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut buffer = Vec::new();
+        doc.save_to(&mut buffer).expect("save");
+        buffer
+    }
+
+    #[test]
+    fn radio_group_reaches_the_public_result() {
+        let pdf = radio_form_pdf();
+        let result = process_pdf_mem(&pdf).expect("process");
+
+        assert_eq!(result.form_controls.len(), 2);
+        assert!(result
+            .form_controls
+            .iter()
+            .all(|c| c.name == "M1860" && c.kind == types::FormControlKind::Radio));
+        assert_eq!(
+            result.form_controls[0].tooltip.as_deref(),
+            Some("Ambulation and locomotion")
+        );
+        let selected: Vec<&str> = result
+            .form_controls
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.export_value.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(selected, vec!["Independent"]);
+    }
+
+    #[test]
+    fn radio_group_reaches_the_markdown() {
+        let markdown = process_pdf_mem(&radio_form_pdf())
+            .expect("process")
+            .markdown
+            .expect("markdown");
+        assert!(
+            markdown.contains("[x]") && markdown.contains("[ ]"),
+            "both states must appear: {markdown}"
+        );
+    }
+
+    #[test]
+    fn form_control_api_matches_the_full_pipeline() {
+        let pdf = radio_form_pdf();
+        let direct = extract_form_controls_mem(&pdf).expect("controls");
+        let full = process_pdf_mem(&pdf).expect("process").form_controls;
+        assert_eq!(direct.len(), full.len());
+        assert_eq!(
+            direct.iter().map(|c| c.checked).collect::<Vec<_>>(),
+            full.iter().map(|c| c.checked).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn document_without_forms_reports_no_controls() {
+        let pdf = std::fs::read("tests/fixtures/thermo-freon12.pdf").expect("fixture");
+        assert!(extract_form_controls_mem(&pdf)
+            .expect("controls")
+            .is_empty());
     }
 }

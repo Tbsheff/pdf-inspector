@@ -59,6 +59,52 @@ pub enum ItemType {
     FormField,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormControlKind {
+    Checkbox,
+    Radio,
+}
+
+impl FormControlKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FormControlKind::Checkbox => "checkbox",
+            FormControlKind::Radio => "radio",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormControlSource {
+    AcroForm,
+    StampImage,
+}
+
+impl FormControlSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FormControlSource::AcroForm => "acroform",
+            FormControlSource::StampImage => "stamp_image",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FormControl {
+    pub name: String,
+    pub kind: FormControlKind,
+    pub export_value: Option<String>,
+    pub checked: bool,
+    pub label: Option<String>,
+    pub tooltip: Option<String>,
+    pub source: FormControlSource,
+    pub page: u32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// Layout complexity analysis result.
 ///
 /// Callers can use this to decide whether the extracted markdown is reliable

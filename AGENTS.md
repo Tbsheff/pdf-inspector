@@ -31,6 +31,9 @@ src/
     mod.rs                      – top-level extraction orchestrator
     content_stream.rs           – PDF operator state machine (Tj/TJ/Td/Tm/q/Q)
     fonts.rs                    – font width/encoding, CMapDecisionCache, TrueType cmap fallback
+    links.rs                    – hyperlinks, AcroForm walk (radio/checkbox widgets)
+    form_controls.rs            – checkbox/radio recovery: AcroForm widgets + flattened
+                                  image stamps (ink classification), label association
     layout.rs                   – column detection (histogram), newspaper/tabular classification,
                                   spanning-line pre-masking, sidebar detection
   tables/
@@ -55,6 +58,14 @@ src/
 - **Newspaper vs tabular** classification determines reading order: newspaper reads columns sequentially, tabular Y-interleaves them.
 - **Tiled-scan detection** catches scanned PDFs with JBIG2/strip images where no single tile exceeds the template threshold but aggregate area does (≥2M pixels).
 - **Garbage text upgrade** reclassifies Mixed PDFs as Scanned when extracted text is <50% alphanumeric.
+- **Form controls** are recovered two ways. Interactive `/AcroForm` `/Btn` widgets
+  inherit `/FT`, `/Ff`, `/V`, `/TU` down to their `/Kids`; each widget becomes one
+  `FormControl` with its `/AP /N` export value. `/AS` decides the state when any
+  widget in the group renders an on state, otherwise the inherited `/V` does
+  (forms filled without regenerating appearances leave every `/AS` at `Off`).
+  Flattened forms draw checkboxes as small image XObjects; those are classified by
+  interior ink vs outline ink and reported with `source: stamp_image`. Both paths
+  emit `[x]` / `[ ]` into the markdown and populate `PdfProcessResult.form_controls`.
 - **Tagged PDF support** uses structure tree roles (H1-H6, P, L, Code, BlockQuote) when available, falling back to font-size heuristics.
 
 ## Testing

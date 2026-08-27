@@ -1,6 +1,6 @@
 //! Hyperlink and AcroForm field extraction.
 
-use crate::types::{ItemType, TextItem};
+use crate::types::{FormControl, FormControlKind, FormControlSource, ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 
@@ -159,13 +159,103 @@ pub(crate) fn extract_link_uri(doc: &Document, annot_dict: &lopdf::Dictionary) -
     None
 }
 
-/// Extract form field values from AcroForm dictionary.
-/// Returns TextItems positioned at each field's Rect so they flow into the markdown pipeline.
+pub(crate) struct FormExtraction {
+    pub(crate) items: Vec<TextItem>,
+    pub(crate) controls: Vec<FormControl>,
+}
+
+impl FormExtraction {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            controls: Vec::new(),
+        }
+    }
+}
+
+const FF_RADIO: i64 = 1 << 15;
+const FF_PUSHBUTTON: i64 = 1 << 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ButtonKind {
+    Checkbox,
+    Radio,
+    PushButton,
+}
+
+fn button_kind(field_flags: i64) -> ButtonKind {
+    if field_flags & FF_PUSHBUTTON != 0 {
+        ButtonKind::PushButton
+    } else if field_flags & FF_RADIO != 0 {
+        ButtonKind::Radio
+    } else {
+        ButtonKind::Checkbox
+    }
+}
+
+fn name_to_string(name: &[u8]) -> String {
+    String::from_utf8_lossy(name).to_string()
+}
+
+fn appearance_state(widget: &lopdf::Dictionary) -> Option<String> {
+    widget
+        .get(b"AS")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .map(name_to_string)
+}
+
+fn widget_export_value(doc: &Document, widget: &lopdf::Dictionary) -> Option<String> {
+    let appearances = widget.get(b"AP").ok().and_then(|o| resolve_dict(doc, o))?;
+    let normal = appearances
+        .get(b"N")
+        .ok()
+        .and_then(|o| resolve_dict(doc, o))?;
+    normal
+        .iter()
+        .map(|(state, _)| name_to_string(state))
+        .find(|state| state != OFF_STATE)
+}
+
+fn button_state_name(value: Option<&Object>) -> Option<String> {
+    value.and_then(|v| v.as_name().ok()).map(name_to_string)
+}
+
+const OFF_STATE: &str = "Off";
+
+fn appearance_state_is_on(widget: &lopdf::Dictionary) -> bool {
+    appearance_state(widget).is_some_and(|state| state != OFF_STATE)
+}
+
+fn group_appearance_is_authoritative(doc: &Document, kids: &[Object]) -> bool {
+    kids.iter()
+        .filter_map(|kid| kid.as_reference().ok())
+        .filter_map(|id| doc.get_dictionary(id).ok())
+        .any(appearance_state_is_on)
+}
+
+fn widget_is_checked(
+    appearance_is_authoritative: bool,
+    own_appearance_state: Option<&str>,
+    own_export_value: Option<&str>,
+    inherited_selected_state: Option<&str>,
+) -> bool {
+    let appearance_on = own_appearance_state.is_some_and(|state| state != OFF_STATE);
+    if appearance_is_authoritative {
+        return appearance_on;
+    }
+    match (own_export_value, inherited_selected_state) {
+        (Some(option), Some(selected)) => option == selected,
+        (_, Some(selected)) => selected != OFF_STATE,
+        (_, None) => appearance_on,
+    }
+}
+
 pub(crate) fn extract_form_fields(
     doc: &Document,
     page_map: &HashMap<ObjectId, u32>,
-) -> Vec<TextItem> {
-    let mut items = Vec::new();
+) -> FormExtraction {
+    let mut items = FormExtraction::new();
 
     // Navigate: trailer -> /Root -> /AcroForm -> /Fields
     let root = match doc.trailer.get(b"Root") {
@@ -219,7 +309,7 @@ pub(crate) fn extract_form_fields(
             walk_form_fields(
                 doc,
                 field_ref,
-                None,
+                InheritedField::default(),
                 "",
                 page_map,
                 &annotation_pages,
@@ -259,16 +349,25 @@ fn annotation_page_map(
     annotation_pages
 }
 
+#[derive(Clone, Copy, Default)]
+struct InheritedField<'a> {
+    field_type: Option<&'a [u8]>,
+    field_flags: i64,
+    value: Option<&'a Object>,
+    tooltip: Option<&'a Object>,
+    appearance_is_authoritative: bool,
+}
+
 /// Recursively walk the form field tree, extracting leaf field values.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn walk_form_fields(
+fn walk_form_fields(
     doc: &Document,
     field_id: ObjectId,
-    parent_ft: Option<&[u8]>,
+    parent: InheritedField<'_>,
     parent_name: &str,
     page_map: &HashMap<ObjectId, u32>,
     annotation_pages: &HashMap<ObjectId, u32>,
-    items: &mut Vec<TextItem>,
+    items: &mut FormExtraction,
     budget: &mut FieldWalkBudget,
     depth: usize,
 ) {
@@ -307,11 +406,24 @@ pub(crate) fn walk_form_fields(
     };
 
     // Determine field type (may be inherited from parent)
-    let ft = field_dict
-        .get(b"FT")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .or(parent_ft);
+    let inherited = InheritedField {
+        field_type: field_dict
+            .get(b"FT")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .or(parent.field_type),
+        field_flags: field_dict
+            .get(b"Ff")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(parent.field_flags),
+        value: field_dict.get(b"V").ok().or(parent.value),
+        tooltip: field_dict.get(b"TU").ok().or(parent.tooltip),
+        appearance_is_authoritative: parent.appearance_is_authoritative
+            || appearance_state_is_on(field_dict),
+    };
+    let mut inherited = inherited;
+    let ft = inherited.field_type;
 
     // Check for /Kids — if present, recurse into children
     if let Ok(kids_obj) = field_dict.get(b"Kids") {
@@ -319,6 +431,7 @@ pub(crate) fn walk_form_fields(
         // `/Kids` would allocate and copy every entry before the budget check
         // below could stop the work.
         if let Some(kids) = resolve_array(doc, kids_obj) {
+            inherited.appearance_is_authoritative |= group_appearance_is_authoritative(doc, kids);
             for kid in kids {
                 // Stop once the budget is spent so a `/Kids` array wider than the
                 // budget can't burn CPU iterating entries whose walk would no-op.
@@ -332,7 +445,7 @@ pub(crate) fn walk_form_fields(
                     walk_form_fields(
                         doc,
                         kid_ref,
-                        ft,
+                        inherited,
                         &full_name,
                         page_map,
                         annotation_pages,
@@ -357,10 +470,67 @@ pub(crate) fn walk_form_fields(
         return;
     }
 
+    let (x, y, width, height) = match field_dict.get(b"Rect") {
+        Ok(rect_obj) => match rect_obj.as_array() {
+            Ok(rect_array) if rect_array.len() >= 4 => {
+                let x1 = get_number(&rect_array[0]).unwrap_or(0.0);
+                let y1 = get_number(&rect_array[1]).unwrap_or(0.0);
+                let x2 = get_number(&rect_array[2]).unwrap_or(0.0);
+                let y2 = get_number(&rect_array[3]).unwrap_or(0.0);
+                (x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs())
+            }
+            _ => (0.0, 0.0, 0.0, 0.0),
+        },
+        Err(_) => (0.0, 0.0, 0.0, 0.0),
+    };
+
+    let page_num = field_dict
+        .get(b"P")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+        .and_then(|p| page_map.get(&p).copied())
+        .or_else(|| annotation_pages.get(&field_id).copied())
+        .unwrap_or(1);
+
+    if ft == b"Btn" {
+        let kind = match button_kind(inherited.field_flags) {
+            ButtonKind::PushButton => return,
+            ButtonKind::Radio => FormControlKind::Radio,
+            ButtonKind::Checkbox => FormControlKind::Checkbox,
+        };
+        let export_value = widget_export_value(doc, field_dict);
+        let checked = widget_is_checked(
+            inherited.appearance_is_authoritative,
+            appearance_state(field_dict).as_deref(),
+            export_value.as_deref(),
+            button_state_name(inherited.value).as_deref(),
+        );
+
+        items.controls.push(FormControl {
+            name: full_name,
+            kind,
+            export_value,
+            checked,
+            label: None,
+            tooltip: inherited
+                .tooltip
+                .and_then(|o| o.as_str().ok())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .filter(|s| !s.is_empty()),
+            source: FormControlSource::AcroForm,
+            page: page_num,
+            x,
+            y,
+            width,
+            height,
+        });
+        return;
+    }
+
     // Get field value
-    let value = match field_dict.get(b"V") {
-        Ok(v) => v,
-        Err(_) => return,
+    let value = match inherited.value {
+        Some(v) => v,
+        None => return,
     };
 
     let value_str = match ft {
@@ -411,37 +581,13 @@ pub(crate) fn walk_form_fields(
         _ => return,
     };
 
-    // Get Rect for positioning
-    let (x, y, width, height) = match field_dict.get(b"Rect") {
-        Ok(rect_obj) => match rect_obj.as_array() {
-            Ok(rect_array) if rect_array.len() >= 4 => {
-                let x1 = get_number(&rect_array[0]).unwrap_or(0.0);
-                let y1 = get_number(&rect_array[1]).unwrap_or(0.0);
-                let x2 = get_number(&rect_array[2]).unwrap_or(0.0);
-                let y2 = get_number(&rect_array[3]).unwrap_or(0.0);
-                (x1, y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs())
-            }
-            _ => (0.0, 0.0, 0.0, 0.0),
-        },
-        Err(_) => (0.0, 0.0, 0.0, 0.0),
-    };
-
-    // Determine page number from /P reference
-    let page_num = field_dict
-        .get(b"P")
-        .ok()
-        .and_then(|o| o.as_reference().ok())
-        .and_then(|p| page_map.get(&p).copied())
-        .or_else(|| annotation_pages.get(&field_id).copied())
-        .unwrap_or(1);
-
     let text = if full_name.is_empty() {
         value_str
     } else {
         format!("{}: {}", full_name, value_str)
     };
 
-    items.push(TextItem {
+    items.items.push(TextItem {
         text,
         x,
         y,
@@ -494,9 +640,9 @@ mod tests {
         let page_map = HashMap::from([(page_one_id, 1), (page_two_id, 2)]);
         let items = extract_form_fields(&doc, &page_map);
 
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].page, 2);
-        assert_eq!(items[0].text, "customer: Alice");
+        assert_eq!(items.items.len(), 1);
+        assert_eq!(items.items[0].page, 2);
+        assert_eq!(items.items[0].text, "customer: Alice");
     }
 
     #[test]
@@ -524,7 +670,7 @@ mod tests {
         let page_map = HashMap::new();
         // Completes (rather than overflowing the stack) and yields no items.
         let items = extract_form_fields(&doc, &page_map);
-        assert!(items.is_empty());
+        assert!(items.items.is_empty());
     }
 
     #[test]
@@ -558,7 +704,7 @@ mod tests {
 
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
-        assert!(items.is_empty());
+        assert!(items.items.is_empty());
     }
 
     #[test]
@@ -599,7 +745,7 @@ mod tests {
 
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
-        assert!(items.is_empty());
+        assert!(items.items.is_empty());
     }
 
     #[test]
@@ -640,8 +786,8 @@ mod tests {
         // Extraction stops at the budget: bounded above by the cap, and it gets
         // right up to it (allowing a small delta for the root/boundary nodes
         // charged against the budget).
-        assert!(items.len() <= MAX_FORM_FIELD_NODES);
-        assert!(items.len() >= MAX_FORM_FIELD_NODES - 3);
+        assert!(items.items.len() <= MAX_FORM_FIELD_NODES);
+        assert!(items.items.len() >= MAX_FORM_FIELD_NODES - 3);
     }
 
     #[test]
@@ -673,8 +819,8 @@ mod tests {
 
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
-        assert!(items.len() <= MAX_FORM_FIELD_NODES);
-        assert!(items.len() >= MAX_FORM_FIELD_NODES - 3);
+        assert!(items.items.len() <= MAX_FORM_FIELD_NODES);
+        assert!(items.items.len() >= MAX_FORM_FIELD_NODES - 3);
     }
 
     #[test]
@@ -717,6 +863,165 @@ mod tests {
 
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.items.len(), 1);
+    }
+
+    fn radio_widget(doc: &mut Document, option: &str, x: i64) -> ObjectId {
+        doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "Rect" => vec![x.into(), 100.into(), (x + 12).into(), 112.into()],
+            "AS" => Object::Name(b"Off".to_vec()),
+            "AP" => dictionary! {
+                "N" => dictionary! {
+                    "Off" => Object::Null,
+                    option => Object::Null,
+                },
+            },
+        })
+    }
+
+    fn radio_group_document(selected: &str, options: &[&str]) -> Document {
+        let mut doc = Document::new();
+        let kids: Vec<Object> = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                Object::Reference(radio_widget(&mut doc, option, 100 + index as i64 * 20))
+            })
+            .collect();
+        let group_id = doc.add_object(dictionary! {
+            "FT" => "Btn",
+            "T" => Object::string_literal("M1860"),
+            "TU" => Object::string_literal("Ambulation and locomotion"),
+            "Ff" => Object::Integer(FF_RADIO),
+            "V" => Object::Name(selected.as_bytes().to_vec()),
+            "Kids" => kids,
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(group_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn radio_group_emits_one_control_per_widget_with_parent_value() {
+        let doc = radio_group_document("3", &["0", "1", "2", "3", "4"]);
+        let controls = extract_form_fields(&doc, &HashMap::new()).controls;
+
+        assert_eq!(controls.len(), 5);
+        assert!(controls
+            .iter()
+            .all(|c| c.kind == FormControlKind::Radio && c.name == "M1860"));
+        assert_eq!(
+            controls
+                .iter()
+                .map(|c| c.export_value.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3", "4"]
+        );
+        assert_eq!(
+            controls.iter().map(|c| c.checked).collect::<Vec<_>>(),
+            vec![false, false, false, true, false]
+        );
+        assert_eq!(
+            controls[0].tooltip.as_deref(),
+            Some("Ambulation and locomotion")
+        );
+    }
+
+    #[test]
+    fn widget_appearance_state_overrides_inherited_value() {
+        let mut doc = radio_group_document("1", &["0", "1"]);
+        let widget_id = doc
+            .objects
+            .iter()
+            .find(|(_, object)| {
+                object.as_dict().is_ok_and(|d| {
+                    d.get(b"Subtype")
+                        .and_then(|s| s.as_name())
+                        .is_ok_and(|n| n == b"Widget")
+                })
+            })
+            .map(|(id, _)| *id)
+            .expect("widget");
+        if let Ok(widget) = doc.get_object_mut(widget_id).and_then(|o| o.as_dict_mut()) {
+            widget.set("AS", Object::Name(b"0".to_vec()));
+        }
+
+        let controls = extract_form_fields(&doc, &HashMap::new()).controls;
+        let checked: Vec<&FormControl> = controls.iter().filter(|c| c.checked).collect();
+        assert_eq!(checked.len(), 1);
+        assert_eq!(checked[0].export_value.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn unchecked_checkbox_is_still_reported() {
+        let mut doc = Document::new();
+        let field_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Btn",
+            "T" => Object::string_literal("fall_risk"),
+            "V" => Object::Name(b"Off".to_vec()),
+            "AS" => Object::Name(b"Off".to_vec()),
+            "Rect" => vec![10.into(), 20.into(), 22.into(), 32.into()],
+            "AP" => dictionary! {
+                "N" => dictionary! {
+                    "Off" => Object::Null,
+                    "Yes" => Object::Null,
+                },
+            },
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(field_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let controls = extract_form_fields(&doc, &HashMap::new()).controls;
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].kind, FormControlKind::Checkbox);
+        assert_eq!(controls[0].export_value.as_deref(), Some("Yes"));
+        assert!(!controls[0].checked);
+    }
+
+    #[test]
+    fn pushbutton_is_not_a_form_control() {
+        let mut doc = Document::new();
+        let field_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Btn",
+            "T" => Object::string_literal("submit"),
+            "Ff" => Object::Integer(FF_PUSHBUTTON),
+            "Rect" => vec![10.into(), 20.into(), 60.into(), 40.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(field_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let extraction = extract_form_fields(&doc, &HashMap::new());
+        assert!(extraction.controls.is_empty());
+        assert!(extraction.items.is_empty());
+    }
+
+    #[test]
+    fn export_value_can_be_a_custom_name() {
+        let doc = radio_group_document("Independent", &["Independent", "NeedsHelp"]);
+        let controls = extract_form_fields(&doc, &HashMap::new()).controls;
+        assert_eq!(controls[0].export_value.as_deref(), Some("Independent"));
+        assert!(controls[0].checked);
+        assert!(!controls[1].checked);
     }
 }
