@@ -213,6 +213,34 @@ fn format_ocr_json(result: &OcrPdfResult) -> String {
     )
 }
 
+fn format_form_controls_json(controls: &[pdf_inspector::FormControl]) -> String {
+    controls
+        .iter()
+        .map(|control| {
+            let optional = |value: &Option<String>| match value {
+                Some(text) => format!(r#""{}""#, json_escape(text)),
+                None => "null".to_string(),
+            };
+            format!(
+                r#"{{"name":"{}","kind":"{}","source":"{}","export_value":{},"checked":{},"label":{},"tooltip":{},"page":{},"x":{:.2},"y":{:.2},"width":{:.2},"height":{:.2}}}"#,
+                json_escape(&control.name),
+                control.kind.as_str(),
+                control.source.as_str(),
+                optional(&control.export_value),
+                control.checked,
+                optional(&control.label),
+                optional(&control.tooltip),
+                control.page,
+                control.x,
+                control.y,
+                control.width,
+                control.height,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn argument_value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
     args.iter()
         .position(|argument| argument == name)
@@ -703,7 +731,7 @@ fn main() {
                     .collect();
                 let ocr_reasons = format_ocr_reasons_by_page(&result.ocr_reasons_by_page);
                 println!(
-                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"markdown":"{}"}}"#,
+                    r#"{{"pdf_type":"{}","page_count":{},"has_text":{},"processing_time_ms":{},"markdown_length":{},"pages_needing_ocr":[{}],"ocr_reasons_by_page":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"has_encoding_issues":{},"form_controls":[{}],"markdown":"{}"}}"#,
                     match result.pdf_type {
                         PdfType::TextBased => "text_based",
                         PdfType::Scanned => "scanned",
@@ -720,6 +748,7 @@ fn main() {
                     table_pages.join(","),
                     col_pages.join(","),
                     result.has_encoding_issues,
+                    format_form_controls_json(&result.form_controls),
                     md_escaped
                 );
             } else if raw_output {

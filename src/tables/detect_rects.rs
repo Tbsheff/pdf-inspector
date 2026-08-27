@@ -1787,7 +1787,8 @@ fn remove_inner_delimiter_spaces(text: &str) -> String {
             let before_close = chars
                 .get(i + 1)
                 .is_some_and(|next| matches!(next, ')' | ']' | '}'));
-            if after_open || before_close {
+            let is_empty_checkbox = after_open && before_close;
+            if (after_open || before_close) && !is_empty_checkbox {
                 continue;
             }
         }
@@ -4471,6 +4472,23 @@ mod tests {
         let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
         assert_eq!(indices.len(), 4);
         assert_eq!(cells[0][0], "The first sentence (twice)");
+    }
+
+    #[test]
+    fn empty_delimiter_pairs_keep_their_space() {
+        assert_eq!(
+            remove_inner_delimiter_spaces("[ ] Fall risk"),
+            "[ ] Fall risk"
+        );
+        assert_eq!(
+            remove_inner_delimiter_spaces("( ) Independent"),
+            "( ) Independent"
+        );
+        assert_eq!(
+            remove_inner_delimiter_spaces("[x] Bedbound"),
+            "[x] Bedbound"
+        );
+        assert_eq!(remove_inner_delimiter_spaces("( twice )"), "(twice)");
     }
 
     #[test]

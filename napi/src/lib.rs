@@ -68,6 +68,43 @@ pub struct PdfResult {
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
+    pub form_controls: Vec<FormControl>,
+}
+
+#[napi(object)]
+pub struct FormControl {
+    pub name: String,
+    pub kind: String,
+    pub source: String,
+    pub export_value: Option<String>,
+    pub checked: bool,
+    pub label: Option<String>,
+    pub tooltip: Option<String>,
+    pub page: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+fn to_form_controls(controls: Vec<pdf_inspector::FormControl>) -> Vec<FormControl> {
+    controls
+        .into_iter()
+        .map(|control| FormControl {
+            name: control.name,
+            kind: control.kind.as_str().to_string(),
+            source: control.source.as_str().to_string(),
+            export_value: control.export_value,
+            checked: control.checked,
+            label: control.label,
+            tooltip: control.tooltip,
+            page: control.page,
+            x: control.x as f64,
+            y: control.y as f64,
+            width: control.width as f64,
+            height: control.height as f64,
+        })
+        .collect()
 }
 
 /// OCR reasons for a single 1-indexed page.
@@ -254,6 +291,7 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        form_controls: to_form_controls(r.form_controls),
     }
 }
 

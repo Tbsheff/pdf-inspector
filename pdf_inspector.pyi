@@ -19,6 +19,28 @@ class PdfResult:
     pages_with_tables: list[int]
     pages_with_columns: list[int]
     has_encoding_issues: bool
+    form_controls: list["FormControl"]
+    """Every checkbox and radio option found, checked or not, in reading order."""
+
+class FormControl:
+    """A single checkbox or radio option with its own position and state."""
+    name: str
+    """Fully qualified AcroForm field name; empty for flattened stamps."""
+    kind: Literal["checkbox", "radio"]
+    source: Literal["acroform", "stamp_image"]
+    """How the control was recovered: interactive widget or flattened image."""
+    export_value: Optional[str]
+    """Radio option id or checkbox on-state; None for flattened stamps."""
+    checked: bool
+    label: Optional[str]
+    """Nearby page text that visually labels this control."""
+    tooltip: Optional[str]
+    """The field's /TU alternate description."""
+    page: int
+    x: float
+    y: float
+    width: float
+    height: float
 
 class PageOcrReasons:
     """OCR reasons for a single 1-indexed page."""
@@ -245,6 +267,22 @@ def extract_structure_elements_bytes(data: bytes, pages: Optional[list[int]] = N
     """Extract structure-tree element references from tagged PDF bytes.
 
     See :func:`extract_structure_elements` for details.
+    """
+    ...
+
+def extract_form_controls(path: str) -> list[FormControl]:
+    """Extract every checkbox and radio option from a PDF file.
+
+    Returns controls in reading order, checked and unchecked alike, from both
+    interactive AcroForm widgets and flattened image checkboxes. Returns an
+    empty list when the PDF has no form controls.
+    """
+    ...
+
+def extract_form_controls_bytes(data: bytes) -> list[FormControl]:
+    """Extract every checkbox and radio option from PDF bytes.
+
+    See :func:`extract_form_controls` for details.
     """
     ...
 

@@ -130,6 +130,43 @@ struct WasmPdfProcessResult {
     confidence: f64,
     layout: WasmLayoutComplexity,
     has_encoding_issues: bool,
+    form_controls: Vec<WasmFormControl>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmFormControl {
+    name: String,
+    kind: &'static str,
+    source: &'static str,
+    export_value: Option<String>,
+    checked: bool,
+    label: Option<String>,
+    tooltip: Option<String>,
+    page: u32,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl From<pdf_inspector::FormControl> for WasmFormControl {
+    fn from(value: pdf_inspector::FormControl) -> Self {
+        Self {
+            name: value.name,
+            kind: value.kind.as_str(),
+            source: value.source.as_str(),
+            export_value: value.export_value,
+            checked: value.checked,
+            label: value.label,
+            tooltip: value.tooltip,
+            page: value.page,
+            x: value.x as f64,
+            y: value.y as f64,
+            width: value.width as f64,
+            height: value.height as f64,
+        }
+    }
 }
 
 impl From<PdfProcessResult> for WasmPdfProcessResult {
@@ -149,6 +186,7 @@ impl From<PdfProcessResult> for WasmPdfProcessResult {
             confidence: value.confidence as f64,
             layout: value.layout.into(),
             has_encoding_issues: value.has_encoding_issues,
+            form_controls: value.form_controls.into_iter().map(Into::into).collect(),
         }
     }
 }
